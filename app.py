@@ -20,7 +20,7 @@ st.markdown("""
 **반편성 원칙:**
 1. **학반별 순환 배정:** 1반(가→나→다), 2반(나→다→가), 3반(다→가→나) 로테이션 적용
 2. **S자형 성적 안배:** 성적 편차 최소화를 위해 S자(ㄹ자) 패턴 적용
-3. **생활지도 집중 분산:** 반별 생활지도 학생 수가 **균등(4~6명)**해질 때까지 최적의 대상을 찾아 교환
+3. **생활지도 집중 분산:** 반별 생활지도 학생 수가 균등해질 때까지(차이 1명 이내) 최적 교환
 """)
 
 # --------------------------------------------------------------------------
@@ -67,6 +67,7 @@ def allocate_class_logic(df):
     """학반별 순환 S자 배정"""
     results = []
     
+    # 2025반과 성별로 그룹핑
     for (old_class, gender), sub_df in df.groupby(['2025반', '성별']):
         sub_df = sub_df.sort_values(by=['총점', '이름'], ascending=[False, True]).copy()
         
@@ -95,11 +96,10 @@ def allocate_class_logic(df):
 
 def distribute_special_students_global(df):
     """
-    [강력해진 분산 로직]
-    가장 많은 반과 가장 적은 반을 찾아, 
-    가능한 모든 조합 중 '점수 차이가 가장 적은' 페어를 찾아 교환합니다.
+    [생활지도 학생 강력 분산]
+    모든 반의 생활지도 학생 수 차이가 1명 이하가 될 때까지 반복 교환
     """
-    max_iter = 200 # 충분한 반복 횟수 보장
+    max_iter = 300 # 충분한 반복 횟수 보장
     
     for i in range(max_iter):
         # 1. 현재 상태 파악
@@ -119,7 +119,6 @@ def distribute_special_students_global(df):
         dst_class = counts.idxmin()
         
         # 4. 교환 가능한 최적의 쌍 찾기 (전수 조사)
-        # src_class의 모든 생활지도 학생
         src_candidates = df[
             (df['신학년반'] == src_class) & 
             (df['생활지도_표시'] == True)
@@ -128,12 +127,12 @@ def distribute_special_students_global(df):
         best_swap_pair = None
         min_score_diff = float('inf')
         
-        # 모든 후보를 검사하여 가장 점수 차이가 적은 경우를 선택
+        # 모든 후보를 검사
         for src_idx, src_student in src_candidates.iterrows():
             s_gender = src_student['성별']
             s_score = src_student['총점']
             
-            # dst_class의 성별 같은 일반 학생들
+            # 부족한 반에서 '성별이 같고' '생활지도가 아닌' 학생 찾기
             dst_candidates = df[
                 (df['신학년반'] == dst_class) & 
                 (df['생활지도_표시'] == False) & 
@@ -144,15 +143,14 @@ def distribute_special_students_global(df):
                 continue
             
             # 점수 차이 계산
-            # (copy를 사용하여 원본 경고 방지)
             current_candidates = dst_candidates.copy()
             current_candidates['diff'] = abs(current_candidates['총점'] - s_score)
             
-            # 가장 점수가 비슷한 학생 찾기
+            # 가장 점수가 비슷한 학생
             best_match = current_candidates.sort_values('diff').iloc[0]
             current_diff = best_match['diff']
             
-            # 지금까지 찾은 것 중 최고면 기록
+            # 역대급으로 점수 차가 적으면 후보 등록
             if current_diff < min_score_diff:
                 min_score_diff = current_diff
                 best_swap_pair = (src_idx, best_match.name)
@@ -161,10 +159,13 @@ def distribute_special_students_global(df):
         if best_swap_pair:
             s_idx, d_idx = best_swap_pair
             # 서로 반을 맞바꿈
-            df.at[s_idx, '신학년반'] = dst_class
-            df.at[d_idx, '신학년반'] = src_class
+            val_src = df.at[s_idx, '신학년반']
+            val_dst = df.at[d_idx, '신학년반']
+            
+            df.at[s_idx, '신학년반'] = val_dst
+            df.at[d_idx, '신학년반'] = val_src
         else:
-            # 더 이상 교환할 수 있는 대상(성별 매칭 등)이 없으면 중단
+            # 교환 대상이 없으면 루프 중단
             break
             
     return df
@@ -197,7 +198,7 @@ if uploaded_file is not None and st.session_state.df_result is None:
             df_allocated = df_allocated.reset_index(drop=True)
             df_final = distribute_special_students_global(df_allocated)
             
-            # 3. 비고 및 정렬
+            # 3. 비고 생성
             df_final['비고'] = df_final['생활지도_표시'].apply(lambda x: '★생활지도' if x else '')
             
             st.session_state.df_result = df_final
@@ -219,7 +220,7 @@ if st.session_state.df_result is not None:
     
     cols = ['신학년반', '이름', '성별', '2025반', '2025번호', '총점', '비고']
     
-    # 다운로드
+    # 다운로드 버튼
     col_h, col_b = st.columns([3, 1])
     with col_h: st.subheader("📋 반편성 결과")
     with col_b:
@@ -230,7 +231,7 @@ if st.session_state.df_result is not None:
 
     st.divider()
 
-    # 맞교환
+    # 맞교환 기능
     with st.expander("🔄 학생 반 맞교환 (수동)", expanded=True):
         df_display['선택라벨'] = df_display.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점 / 구 {x['2025반']}반)", axis=1)
         c1, c2, c3 = st.columns([2, 2, 1])
@@ -240,20 +241,63 @@ if st.session_state.df_result is not None:
             st.write(""); st.write("")
             if st.button("교환하기"):
                 if s_a != s_b:
-                    def get_idx(label):
-                        r = df_display[df_display['선택라벨'] == label].iloc[0]
-                        return st.session_state.df_result[
-                            (st.session_state.df_result['이름'] == r['이름']) &
-                            (st.session_state.df_result['2025반'] == r['2025반']) &
-                            (st.session_state.df_result['2025번호'] == r['2025번호'])
-                        ].index[0]
-                    
+                    # 원본 데이터 인덱스 찾기
                     try:
-                        idx_a = get_idx(s_a)
-                        idx_b = get_idx(s_b)
+                        row_a = df_display[df_display['선택라벨'] == s_a].iloc[0]
+                        row_b = df_display[df_display['선택라벨'] == s_b].iloc[0]
+                        
+                        # 이름, 반, 번호로 고유 식별
+                        idx_a = st.session_state.df_result[
+                            (st.session_state.df_result['이름'] == row_a['이름']) &
+                            (st.session_state.df_result['2025반'] == row_a['2025반']) &
+                            (st.session_state.df_result['2025번호'] == row_a['2025번호'])
+                        ].index[0]
+                        
+                        idx_b = st.session_state.df_result[
+                            (st.session_state.df_result['이름'] == row_b['이름']) &
+                            (st.session_state.df_result['2025반'] == row_b['2025반']) &
+                            (st.session_state.df_result['2025번호'] == row_b['2025번호'])
+                        ].index[0]
                         
                         val_a = st.session_state.df_result.at[idx_a, '신학년반']
                         val_b = st.session_state.df_result.at[idx_b, '신학년반']
                         
                         st.session_state.df_result.at[idx_a, '신학년반'] = val_b
-                        st.session_state.df_result.
+                        st.session_state.df_result.at[idx_b, '신학년반'] = val_a
+                        
+                        st.success("교환 완료!"); st.rerun()
+                    except Exception as e:
+                        st.error(f"오류가 발생했습니다: {e}")
+                else:
+                    st.warning("다른 학생을 선택해주세요.")
+
+    # 탭 화면
+    tabs = st.tabs(["가반", "나반", "다반", "전체"])
+    
+    def show_tab(cls_name):
+        subset = df_display[df_display['신학년반'] == cls_name][cols]
+        count = len(subset)
+        special = len(subset[subset['비고'] != ''])
+        avg = subset['총점'].mean() if count > 0 else 0
+        
+        msg = f"👥 총원: {count}명 | ⚠️ 생활지도: {special}명 | 📊 평균점수: {avg:.1f}점"
+        
+        # 4~6명 적정선 시각화
+        if 4 <= special <= 6:
+            st.success(msg + " (적정)")
+        else:
+            st.warning(msg + " (조정 권장)")
+        
+        st.dataframe(
+            subset.style.apply(lambda x: ['background-color: #ffcccc' if v else '' for v in x], subset=['비고'], axis=1),
+            use_container_width=True, hide_index=True, height=800
+        )
+
+    with tabs[0]: show_tab('가')
+    with tabs[1]: show_tab('나')
+    with tabs[2]: show_tab('다')
+    with tabs[3]: st.dataframe(df_display[cols], use_container_width=True, height=800)
+    
+    if st.button("초기화"):
+        st.session_state.df_result = None
+        st.rerun()
