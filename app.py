@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import io
-import math
 
 # --------------------------------------------------------------------------
 # 1. 기본 설정 및 스타일
@@ -17,7 +16,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏫 2026학년도 초등학교 반편성 시스템")
-st.markdown("첨부된 **반편성 계획**에 의거하여 성적순 S자 배치 및 **생활지도 학생 자동 분산**을 수행합니다.")
+st.markdown("첨부된 **반편성 계획**에 의거하여 **각 반별 균등 분할** 및 **생활지도 학생 분산**을 수행합니다.")
 
 # --------------------------------------------------------------------------
 # 2. 데이터 처리 및 알고리즘 함수
@@ -49,24 +48,26 @@ def preprocess_data(df):
     for col in ['2025반', '2025번호']:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
     
-    # [핵심] 생활지도 컬럼이 비어있지 않으면(숫자든 텍스트든) True
+    # [생활지도] 텍스트나 숫자가 있으면 True
     if '생활지도' in df.columns:
-        # 빈 문자열이나 NaN이 아닌 경우 모두 True로 처리
-        df['생활지도_표시'] = df['생활지도'].astype(str).apply(lambda x: True if x.strip() not in ['nan', '', '0', '0.0'] else False)
+        df['생활지도_표시'] = df['생활지도'].astype(str).apply(
+            lambda x: True if x.strip() not in ['nan', '', '0', '0.0', 'None'] else False
+        )
     else:
         df['생활지도_표시'] = False
         
     return df, None
 
-def s_shape_grouping(df):
+def s_shape_grouping_logic(subset_df):
     """
-    성적순 S자 그룹핑 (인원 불균형 자동 해소)
-    나머지가 생기면(예: 29, 29, 28) 앞에서부터 채워지므로 자연스럽게 배분됨
+    S자 그룹핑 로직 (단일 그룹용)
     """
-    df = df.sort_values(by=['총점', '이름'], ascending=[False, True]).reset_index(drop=True)
+    # 성적순 정렬 (동점자는 이름순)
+    subset_df = subset_df.sort_values(by=['총점', '이름'], ascending=[False, True]).reset_index(drop=True)
     groups = []
-    # 전체 인원을 돌면서 6개 단위 패턴 반복 -> 남는 인원은 순서대로 A, B... 배정됨
-    for i in range(len(df)):
+    
+    # 6명 단위 S자 패턴 (A->B->C->C->B->A)
+    for i in range(len(subset_df)):
         cycle = i % 6 
         if cycle == 0: group = 'A'
         elif cycle == 1: group = 'B'
@@ -75,17 +76,37 @@ def s_shape_grouping(df):
         elif cycle == 4: group = 'B'
         else: group = 'A'
         groups.append(group)
-    df['그룹'] = groups
+        
+    subset_df['그룹'] = groups
+    # 성적 순위 저장 (추후 교환 로직에서 사용)
+    subset_df['성적순위'] = subset_df['총점'].rank(method='min', ascending=False)
+    return subset_df
+
+def apply_grouping_by_class(df):
+    """
+    [핵심 수정] 전체가 아니라 '각 반별 + 성별'로 나누어 그룹핑 수행
+    이렇게 해야 1반 안에서 A,B,C가 1:1:1로 나오고, 결과적으로 전체 인원 균형이 맞음
+    """
+    grouped_results = []
     
-    # 나중에 교환 로직을 위해 '석차' 정보를 저장해둠 (성적 유사도 판단용)
-    df['성적순위'] = df.index
-    return df
+    # 2025반과 성별로 그룹을 나눔 (예: 1반 남, 1반 여, 2반 남...)
+    # groupby 객체를 리스트로 변환하지 않고 직접 순회
+    for (cls, gender), group_df in df.groupby(['2025반', '성별']):
+        processed_group = s_shape_grouping_logic(group_df.copy())
+        grouped_results.append(processed_group)
+        
+    if not grouped_results:
+        return df # 데이터가 없을 경우
+        
+    return pd.concat(grouped_results, ignore_index=True)
 
 def assign_new_class(row):
     """기본 반 배정 로직"""
     old_class = str(row['2025반'])
     group = row['그룹']
     
+    # 2025반 데이터가 1,2,3 외의 숫자일 경우 처리 필요하지만
+    # 기본적으로 1,2,3반 로직만 문서에 있으므로 이에 따름
     if old_class == '1':
         return {'A': '가', 'B': '다', 'C': '나'}.get(group, '미배정')
     elif old_class == '2':
@@ -96,59 +117,56 @@ def assign_new_class(row):
 
 def distribute_special_students(df):
     """
-    [핵심 기능] 생활지도 학생 자동 분산 알고리즘
-    - 반별 생활지도 학생 수를 체크하여, 몰려있으면 다른 반의 '비슷한 등수' 학생과 맞교환
+    생활지도 학생 자동 분산 (1:1 교환 방식이라 인원수 변화 없음)
     """
-    # 최대 반복 횟수 (무한 루프 방지)
-    max_iter = 5
+    max_iter = 10 # 반복 횟수 증가
     
     for _ in range(max_iter):
-        # 현재 반별 생활지도 학생 수 집계
+        # 전체 반별 생활지도 학생 수 체크
         counts = df[df['생활지도_표시'] == True]['신학년반'].value_counts()
         if counts.empty: break
         
         max_count = counts.max()
         min_count = counts.min()
         
-        # 가장 많은 반과 적은 반의 차이가 1명 이하면 균형 잡힌 것으로 간주 (종료)
+        # 차이가 1명 이하면 균형으로 간주
         if max_count - min_count <= 1:
             break
             
-        # 과밀 학급과 부족 학급 식별
         overloaded_class = counts.idxmax()
-        # 부족한 반 찾기 (가, 나, 다 중 counts에 없거나 가장 적은 반)
+        
+        # 가장 적은 반 찾기 (가,나,다 중)
         all_classes = ['가', '나', '다']
         current_counts = {c: counts.get(c, 0) for c in all_classes}
         target_class = min(current_counts, key=current_counts.get)
         
-        # 교환 대상 찾기 (과밀 반의 생활지도 학생 중 하나)
-        # 성적 순위를 기준으로 정렬해서, 가능한 중간 등수의 학생을 옮기는 게 안전하지만
-        # 여기서는 가장 먼저 발견된 학생을 이동 시도
+        # 교환 대상 1: 과밀 반의 생활지도 학생
         candidates = df[(df['신학년반'] == overloaded_class) & (df['생활지도_표시'] == True)]
-        
         if candidates.empty: break
         
-        # 이동할 생활지도 학생 (Target A)
         target_student = candidates.iloc[0]
-        target_idx = target_student.name # DataFrame Index
-        target_rank = target_student['성적순위']
+        target_idx = target_student.name 
         
-        # 맞교환할 상대방 찾기 (Target B: 부족 반의 일반 학생 중 성적이 가장 비슷한 학생)
-        # 조건: 생활지도가 아니어야 함
-        dest_candidates = df[(df['신학년반'] == target_class) & (df['생활지도_표시'] == False)].copy()
+        # 교환 대상 2: 부족 반의 일반 학생 (성별 같아야 함!)
+        # 성별 조건을 추가하여 남녀 성비 유지
+        target_gender = target_student['성별']
         
-        if dest_candidates.empty: break # 교환할 일반 학생이 없으면 중단
+        dest_candidates = df[
+            (df['신학년반'] == target_class) & 
+            (df['생활지도_표시'] == False) &
+            (df['성별'] == target_gender)
+        ].copy()
         
-        # 성적 순위 차이가 가장 적은 학생 찾기
-        dest_candidates['rank_diff'] = abs(dest_candidates['성적순위'] - target_rank)
-        swap_student = dest_candidates.sort_values('rank_diff').iloc[0]
+        if dest_candidates.empty: break 
+        
+        # 성적 차이가 가장 적은 학생 찾기
+        dest_candidates['score_diff'] = abs(dest_candidates['총점'] - target_student['총점'])
+        swap_student = dest_candidates.sort_values('score_diff').iloc[0]
         swap_idx = swap_student.name
         
-        # 맞교환 실행
+        # 맞교환
         df.at[target_idx, '신학년반'] = target_class
         df.at[swap_idx, '신학년반'] = overloaded_class
-        
-        # 루프 다시 돌면서 균형 맞을 때까지 반복
         
     return df
 
@@ -173,39 +191,33 @@ if uploaded_file is not None and st.session_state.df_result is None:
         if error_msg:
             st.error(error_msg)
         else:
-            # 1. 성별 분리 후 S자 그룹핑 (성적 균형)
-            df_male = df[df['성별'] == '남'].copy()
-            df_female = df[df['성별'] != '남'].copy()
+            # 1. [핵심 변경] 전체가 아닌 '반별+성별' 그룹핑
+            # 이렇게 하면 1반 남학생 10명이면 A,B,C가 3,4,3명으로 나뉨 -> 인원 균형 보장
+            df_grouped = apply_grouping_by_class(df)
             
-            df_male = s_shape_grouping(df_male)
-            df_female = s_shape_grouping(df_female)
+            # 2. 반 배정 (미배정 데이터 필터링 가능성 대비)
+            df_grouped['신학년반'] = df_grouped.apply(assign_new_class, axis=1)
             
-            # 2. 합치기 (인덱스 리셋하여 고유 ID처럼 사용)
-            result_df = pd.concat([df_male, df_female], ignore_index=True)
+            # 미배정(4반 등)이 있을 수 있으므로 가/나/다 만 필터링하거나 그대로 둠
+            # 여기서는 로직상 '미배정' 텍스트가 들어갈 수 있음
             
-            # 3. 1차 반 배정
-            result_df['신학년반'] = result_df.apply(assign_new_class, axis=1)
+            # 3. 생활지도 학생 분산 (성별 내부 교환이므로 인원/성비 불변)
+            # 남/녀 각각 최적화 수행
+            mask_male = df_grouped['성별'] == '남'
+            df_m_opt = distribute_special_students(df_grouped[mask_male].copy())
             
-            # 4. [New] 생활지도 학생 자동 분산 (남/녀 각각 수행하여 성비 유지)
-            # 남자 안에서 교환, 여자 안에서 교환해야 성비가 안 깨짐
+            mask_female = df_grouped['성별'] != '남'
+            df_f_opt = distribute_special_students(df_grouped[mask_female].copy())
             
-            # 남자 분산
-            mask_male = result_df['성별'] == '남'
-            df_m_only = result_df[mask_male].copy()
-            df_m_optimized = distribute_special_students(df_m_only)
-            result_df.update(df_m_optimized)
+            # 인덱스 기준으로 원본 업데이트
+            df_grouped.update(df_m_opt)
+            df_grouped.update(df_f_opt)
             
-            # 여자 분산
-            mask_female = result_df['성별'] != '남'
-            df_f_only = result_df[mask_female].copy()
-            df_f_optimized = distribute_special_students(df_f_only)
-            result_df.update(df_f_optimized)
+            # 4. 비고 생성
+            df_grouped['비고'] = df_grouped['생활지도_표시'].apply(lambda x: '★생활지도' if x else '')
             
-            # 5. 비고 및 최종 정리
-            result_df['비고'] = result_df['생활지도_표시'].apply(lambda x: '★생활지도' if x else '')
-            
-            st.session_state.df_result = result_df
-            st.success("✅ 자동 반편성 완료! (인원 균형 및 생활지도 학생 분산 적용됨)")
+            st.session_state.df_result = df_grouped
+            st.success("✅ 반편성 완료! (각 반별 인원 균등 배분 적용됨)")
             st.rerun()
 
     except Exception as e:
@@ -217,13 +229,13 @@ if uploaded_file is not None and st.session_state.df_result is None:
 if st.session_state.df_result is not None:
     df_display = st.session_state.df_result.copy()
     
-    # 정렬
+    # 정렬 (가나다 -> 성별(여우선) -> 이름)
     df_display['성별_order'] = df_display['성별'].apply(lambda x: 0 if x != '남' else 1)
     df_display = df_display.sort_values(by=['신학년반', '성별_order', '이름']).reset_index(drop=True)
     
     cols = ['신학년반', '이름', '성별', '2025반', '2025번호', '총점', '그룹', '비고']
     
-    # 상단 다운로드 버튼
+    # 다운로드 버튼
     col_h, col_b = st.columns([3, 1])
     with col_h: st.subheader("📋 반편성 결과")
     with col_b:
@@ -236,7 +248,7 @@ if st.session_state.df_result is not None:
 
     # 맞교환 UI
     with st.expander("🔄 학생 반 맞교환 (수동)", expanded=True):
-        df_display['선택라벨'] = df_display.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점)", axis=1)
+        df_display['선택라벨'] = df_display.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점 / 구 {x['2025반']}반)", axis=1)
         c1, c2, c3 = st.columns([2, 2, 1])
         with c1: s_a = st.selectbox("학생 A", df_display['선택라벨'].unique(), key='a')
         with c2: s_b = st.selectbox("학생 B", df_display['선택라벨'].unique(), key='b')
@@ -244,17 +256,16 @@ if st.session_state.df_result is not None:
             st.write(""); st.write("")
             if st.button("교환하기"):
                 if s_a != s_b:
-                    # 원본 인덱스 찾아서 교환 (이름, 2025반, 번호 기준)
-                    def get_real_idx(label):
-                        row = df_display[df_display['선택라벨'] == label].iloc[0]
+                    def get_idx(label):
+                        r = df_display[df_display['선택라벨'] == label].iloc[0]
                         return st.session_state.df_result[
-                            (st.session_state.df_result['이름'] == row['이름']) &
-                            (st.session_state.df_result['2025반'] == row['2025반']) &
-                            (st.session_state.df_result['2025번호'] == row['2025번호'])
+                            (st.session_state.df_result['이름'] == r['이름']) &
+                            (st.session_state.df_result['2025반'] == r['2025반']) &
+                            (st.session_state.df_result['2025번호'] == r['2025번호'])
                         ].index[0]
                     
-                    idx_a = get_real_idx(s_a)
-                    idx_b = get_real_idx(s_b)
+                    idx_a = get_idx(s_a)
+                    idx_b = get_idx(s_b)
                     
                     val_a = st.session_state.df_result.at[idx_a, '신학년반']
                     val_b = st.session_state.df_result.at[idx_b, '신학년반']
@@ -263,16 +274,16 @@ if st.session_state.df_result is not None:
                     st.session_state.df_result.at[idx_b, '신학년반'] = val_a
                     st.success("교환 완료!"); st.rerun()
 
-    # 탭 화면 (요약 정보 포함)
+    # 결과 탭
     tabs = st.tabs(["가반", "나반", "다반", "전체"])
     
     def show_tab(cls_name):
         subset = df_display[df_display['신학년반'] == cls_name][cols]
         count = len(subset)
-        special_count = len(subset[subset['비고'] != ''])
-        avg = subset['총점'].mean()
+        special = len(subset[subset['비고'] != ''])
+        avg = subset['총점'].mean() if count > 0 else 0
         
-        st.info(f"👥 총원: {count}명 | ⚠️ 생활지도: {special_count}명 | 📊 평균점수: {avg:.1f}점")
+        st.info(f"👥 총원: {count}명 | ⚠️ 생활지도: {special}명 | 📊 평균점수: {avg:.1f}점")
         
         st.dataframe(
             subset.style.apply(lambda x: ['background-color: #ffcccc' if v else '' for v in x], subset=['비고'], axis=1),
