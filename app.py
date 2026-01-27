@@ -20,7 +20,7 @@ st.markdown("""
 **반편성 원칙:**
 1. **학반별 순환 배정:** 1반(가→나→다), 2반(나→다→가)... 순환 S자 배정
 2. **생활지도 분산:** 반별 생활지도 학생 수 균형 (4~6명 목표)
-3. **[New] 출신 학반 안배:** 각 반에 구학년(2025) 같은 반 친구가 **최소 4명 이상** 포함되도록 유지
+3. **출신 학반/성별 안배:** 각 반에 구학년(2025) 같은 반 **동성 친구가 최소 4명 이상** 포함되도록 유지
 """)
 
 # --------------------------------------------------------------------------
@@ -89,22 +89,23 @@ def check_conflict_safety(df, student_idx, target_class):
 
 def check_old_class_constraint(df, student_idx, current_class, min_count=4):
     """
-    [New] 구학년 반 친구 최소 인원(4명) 보존 체크
-    이 학생이 빠져나가도, 해당 반에 구학년 친구들이 min_count 이상 남는가?
+    [New] 구학년 반 친구 최소 인원 보존 체크 (성별 구분!)
+    이 학생(남)이 빠져나가도, 해당 반에 구학년 남학생 친구들이 4명 이상 남는가?
     """
     student = df.loc[student_idx]
     old_cls = student['2025반']
+    gender = student['성별']
     
-    # 현재 반에 있는 '나와 같은 구반 친구들' 수 (나 포함)
+    # 현재 반에 있는 '나와 같은 구반 동성 친구들' 수 (나 포함)
     count = len(df[
         (df['신학년반'] == current_class) & 
-        (df['2025반'] == old_cls)
+        (df['2025반'] == old_cls) &
+        (df['성별'] == gender)
     ])
     
     # 내가 나가면 (count - 1)명이 됨.
-    # 그 수가 min_count보다 작아지면 안 됨. (즉, 현재 count가 min_count보다 커야 나갈 수 있음)
     if count <= min_count:
-        return False # 이동 불가 (인원 부족)
+        return False # 이동 불가
     
     return True # 이동 가능
 
@@ -142,36 +143,26 @@ def resolve_conflicts_first(df):
         enemies = df[(df['이름'] == enemy_name) & (df['신학년반'] == my_class)]
         
         if not enemies.empty:
-            # 이동 필요. 이동 가능한 반 찾기
             available_classes = [c for c in classes if c != my_class]
             
             for target_class in available_classes:
-                # 1. 앙숙 안전 체크
                 if not check_conflict_safety(df, idx, target_class): continue
-                
-                # 2. [New] 내 구반 친구들이 4명 이하로 떨어지면 못 나감
+                # [New] 성별 구분 인원 체크
                 if not check_old_class_constraint(df, idx, my_class): continue
                 
-                # 교환 대상 찾기
                 swap_candidates = df[
                     (df['신학년반'] == target_class) &
                     (df['생활지도_표시'] == False) &
                     (df['성별'] == row['성별'])
                 ]
                 
-                # 교환 대상의 조건 체크
-                valid_swap_target = None
-                
-                # 점수 차이 순으로 정렬하여 시도
                 swap_candidates = swap_candidates.copy()
                 swap_candidates['diff'] = abs(swap_candidates['총점'] - row['총점'])
                 swap_candidates = swap_candidates.sort_values('diff')
                 
+                valid_swap_target = None
                 for s_idx, s_row in swap_candidates.iterrows():
-                    # 대상이 내 반으로 와도 안전한가?
                     if not check_conflict_safety(df, s_idx, my_class): continue
-                    
-                    # [New] 대상이 자기 반을 떠나도 구반 친구가 유지되는가?
                     if not check_old_class_constraint(df, s_idx, target_class): continue
                     
                     valid_swap_target = s_idx
@@ -204,9 +195,8 @@ def distribute_special_students_global(df):
         min_score_diff = float('inf')
         
         for src_idx, src_student in src_candidates.iterrows():
-            # 안전 및 제약 조건 체크
             if not check_conflict_safety(df, src_idx, dst_class): continue
-            if not check_old_class_constraint(df, src_idx, src_class): continue # [New]
+            if not check_old_class_constraint(df, src_idx, src_class): continue 
             
             s_gender = src_student['성별']
             s_score = src_student['총점']
@@ -219,7 +209,7 @@ def distribute_special_students_global(df):
             
             for d_idx, d_row in dst_candidates.iterrows():
                 if not check_conflict_safety(df, d_idx, src_class): continue
-                if not check_old_class_constraint(df, d_idx, dst_class): continue # [New]
+                if not check_old_class_constraint(df, d_idx, dst_class): continue 
                 
                 diff = abs(d_row['총점'] - s_score)
                 if diff < min_score_diff:
@@ -258,17 +248,11 @@ if uploaded_file is not None and st.session_state.df_result is None:
         if error_msg:
             st.error(error_msg)
         else:
-            # 1. 초기 배정
             df_allocated = allocate_class_logic(df)
             df_allocated = df_allocated.reset_index(drop=True)
-            
-            # 2. 앙숙 관계 해결 (제약 조건 포함)
             df_allocated = resolve_conflicts_first(df_allocated)
-            
-            # 3. 생활지도 균형 (제약 조건 포함)
             df_final = distribute_special_students_global(df_allocated)
             
-            # 비고 생성
             def make_note(row):
                 notes = []
                 if row['생활지도_표시']: notes.append('★생활지도')
@@ -277,7 +261,7 @@ if uploaded_file is not None and st.session_state.df_result is None:
             df_final['비고'] = df_final.apply(make_note, axis=1)
             
             st.session_state.df_result = df_final
-            st.success("✅ 반편성 완료! (출신 학반 4명 이상 보장 & 생활지도 분산)")
+            st.success("✅ 반편성 완료! (성별별 구학년 친구 4명 이상 보장)")
             st.rerun()
 
     except Exception as e:
@@ -306,7 +290,7 @@ if st.session_state.df_result is not None:
 
     # 맞교환 기능
     with st.expander("🔄 학생 반 맞교환 (수동)", expanded=True):
-        df_display['선택라벨'] = df_display.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점 / 구 {x['2025반']}반)", axis=1)
+        df_display['선택라벨'] = df_display.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점)", axis=1)
         c1, c2, c3 = st.columns([2, 2, 1])
         with c1: s_a = st.selectbox("학생 A", df_display['선택라벨'].unique(), key='a')
         with c2: s_b = st.selectbox("학생 B", df_display['선택라벨'].unique(), key='b')
@@ -330,19 +314,14 @@ if st.session_state.df_result is not None:
                             (st.session_state.df_result['2025번호'] == row_b['2025번호'])
                         ].index[0]
                         
-                        # 안전 체크
+                        # 안전 및 인원 체크
                         safe_a = check_conflict_safety(st.session_state.df_result, idx_a, row_b['신학년반'])
                         safe_b = check_conflict_safety(st.session_state.df_result, idx_b, row_a['신학년반'])
+                        if not (safe_a and safe_b): st.warning("⚠️ 주의: 분리 배정 위반 가능성")
                         
-                        if not (safe_a and safe_b):
-                            st.warning("⚠️ 주의: 분리 배정 원칙 위반 가능성이 있습니다.")
-                            
-                        # 구반 인원 체크 (수동은 경고만 하고 허용)
-                        valid_old_a = check_old_class_constraint(st.session_state.df_result, idx_a, row_a['신학년반'])
-                        valid_old_b = check_old_class_constraint(st.session_state.df_result, idx_b, row_b['신학년반'])
-                        
-                        if not (valid_old_a and valid_old_b):
-                            st.warning("⚠️ 주의: 구학년 친구 최소 인원(4명)이 깨질 수 있습니다.")
+                        old_a = check_old_class_constraint(st.session_state.df_result, idx_a, row_a['신학년반'])
+                        old_b = check_old_class_constraint(st.session_state.df_result, idx_b, row_b['신학년반'])
+                        if not (old_a and old_b): st.warning("⚠️ 주의: 구학년 동성 친구 4명 미만 발생 가능성")
 
                         val_a = st.session_state.df_result.at[idx_a, '신학년반']
                         val_b = st.session_state.df_result.at[idx_b, '신학년반']
@@ -361,16 +340,28 @@ if st.session_state.df_result is not None:
         special = len(subset[subset['비고'].str.contains('생활지도')])
         avg = subset['총점'].mean() if count > 0 else 0
         
-        # 구학년 분포 확인
-        old_dist = subset['2025반'].value_counts().sort_index()
-        old_dist_str = ", ".join([f"{k}반:{v}명" for k, v in old_dist.items()])
+        # [New] 구반 성별 분포 상세 표시
+        old_dist = subset.groupby(['2025반', '성별']).size().unstack(fill_value=0)
+        # unstack 결과에 남/여 컬럼이 없을 수 있으므로 처리
+        if '남' not in old_dist.columns: old_dist['남'] = 0
+        if '여' not in old_dist.columns: old_dist['여'] = 0
+        
+        dist_str_list = []
+        warning_msg = ""
+        for cls_num, row in old_dist.iterrows():
+            m_cnt, f_cnt = row.get('남', 0), row.get('여', 0)
+            dist_str_list.append(f"{cls_num}반(남{m_cnt}/여{f_cnt})")
+            if m_cnt > 0 and m_cnt < 4: warning_msg = " (남학생 4명 미만!)"
+            if f_cnt > 0 and f_cnt < 4: warning_msg = " (여학생 4명 미만!)"
+            
+        dist_str = ", ".join(dist_str_list)
         
         st.info(f"👥 총원: {count}명 | ⚠️ 생활지도: {special}명 | 📊 평균: {avg:.1f}점")
-        # 구반 분포 표시 (중요)
-        if any(v < 4 for v in old_dist.values):
-            st.error(f"🚨 출신 학반 분포 불균형: {old_dist_str} (4명 미만 있음!)")
+        
+        if warning_msg:
+            st.error(f"🚨 출신 분포: {dist_str} {warning_msg}")
         else:
-            st.success(f"✅ 출신 학반 분포: {old_dist_str}")
+            st.success(f"✅ 출신 분포: {dist_str}")
         
         st.dataframe(
             subset.style.apply(lambda x: ['background-color: #ffcccc' if '생활지도' in v else '' for v in x], subset=['비고'], axis=1),
