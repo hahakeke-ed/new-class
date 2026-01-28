@@ -15,306 +15,314 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🏫 2026학년도 초등학교 반편성 시스템")
+st.title("🏫 2026학년도 초등학교 반편성 시스템 (최종버전)")
 st.markdown("""
 **반편성 핵심 원칙:**
 1. **[0순위] 동명이인 분리:** 이름이 같은 학생은 무조건 다른 반 배정
-2. **[1순위] 분리 배정:** 특정 학생(앙숙)간 분리
+2. **[1순위] 분리 요청 해결:** '분리요청' 칸에 적힌 학생과는 절대 같은 반 배정 금지
 3. **[2순위] 구학년 안배:** 반별 구학년 동성 친구 최소 4명 이상 유지
-4. **[3순위] 생활지도 균형:** 생활지도 학생 반별 균등(4~6명) 배치
+4. **[3순위] 생활지도 균형:** '생활지도 곤란' 학생 반별 균등(4~6명) 배치
 """)
 
 # --------------------------------------------------------------------------
 # 2. 데이터 처리 및 알고리즘 함수
 # --------------------------------------------------------------------------
 def preprocess_data(df):
+    """
+    데이터 정제: 생활지도와 분리요청을 별도 컬럼으로 처리
+    """
+    # 1. 컬럼명 매핑 (업로드한 파일 기준)
+    # 파일의 헤더: 학반, 번호, 성별, 성명, 시험1, 시험2, 합, 생활지도 곤란, 분리요청
     col_map = {
-        '성명': '이름',
-        '합': '총점',
         '학반': '2025반',
         '번호': '2025번호',
-        '생활지도 곤란': '생활지도'
+        '성명': '이름',
+        '합': '총점',
+        '생활지도 곤란': '생활지도',
+        '분리요청': '분리요청'
     }
+    # 매핑되지 않은 나머지 컬럼은 그대로 둠
     df = df.rename(columns=col_map)
     
-    required = ['이름', '성별', '총점', '2025반', '2025번호']
+    # 2. 필수 컬럼 체크
+    required = ['2025반', '2025번호', '성별', '이름', '총점']
     if not all(col in df.columns for col in required):
         return None, f"필수 컬럼이 누락되었습니다. (필요: {required}, 현재: {list(df.columns)})"
 
     df = df.dropna(subset=['이름'])
     
-    # 점수 처리
+    # 3. 점수 및 번호 정수 변환
     df['총점'] = pd.to_numeric(df['총점'], errors='coerce')
     avg_score = df['총점'].mean()
     if pd.isna(avg_score): avg_score = 0 
     df['총점'] = df['총점'].fillna(avg_score).round().astype(int)
     
-    # 반, 번호 처리
     for col in ['2025반', '2025번호']:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
     
-    # 생활지도 및 분리 대상 처리
+    # 4. [핵심] 생활지도 vs 분리요청 이원화 처리
+    
+    # (1) 생활지도 여부 (Behavior): 값이 있으면 True (점수든 O든)
     if '생활지도' in df.columns:
-        df['생활지도_표시'] = df['생활지도'].astype(str).apply(
-            lambda x: True if x.strip() not in ['nan', '', '0', '0.0', 'None'] else False
+        df['is_behavior'] = df['생활지도'].astype(str).apply(
+            lambda x: True if x.strip() not in ['nan', '', 'None', '0', '0.0'] else False
         )
-        def extract_conflict(val):
+    else:
+        df['is_behavior'] = False
+        
+    # (2) 분리 요청 대상 (Separation): 텍스트가 있으면 그 이름을 저장
+    if '분리요청' in df.columns:
+        def extract_name(val):
             s = str(val).strip()
             if s in ['nan', '', 'None', '0', '0.0']: return None
+            # 숫자로만 된 게 아니면 이름으로 간주
             if not s.replace('.', '').isdigit(): return s
             return None
-        df['분리대상'] = df['생활지도'].apply(extract_conflict)
+        df['conflict_target'] = df['분리요청'].apply(extract_name)
     else:
-        df['생활지도_표시'] = False
-        df['분리대상'] = None
+        df['conflict_target'] = None
         
     return df, None
 
-# --- 안전 장치 함수들 ---
-def check_conflict_safety(df, student_idx, target_class):
-    """분리 배정(앙숙) 안전 체크"""
-    student = df.loc[student_idx]
-    enemy_name = student['분리대상']
-    
-    if enemy_name:
-        enemies = df[(df['이름'] == enemy_name) & (df['신학년반'] == target_class)]
-        if not enemies.empty: return False
-
-    my_name = student['이름']
-    haters = df[(df['신학년반'] == target_class) & (df['분리대상'] == my_name)]
-    if not haters.empty: return False
-    return True
-
-def check_old_class_constraint(df, student_idx, current_class, min_count=4):
-    """구학년 동성 친구 최소 인원 보존 체크"""
-    student = df.loc[student_idx]
-    old_cls = student['2025반']
-    gender = student['성별']
-    
-    count = len(df[
-        (df['신학년반'] == current_class) & 
-        (df['2025반'] == old_cls) &
-        (df['성별'] == gender)
-    ])
-    
-    # 내가 나가면 (count-1)명이 됨. 그게 min_count보다 작으면 안됨
-    if count <= min_count: return False
-    return True
+# --- 제약 조건 검사 함수들 ---
 
 def check_homonym_safety(df, student_idx, target_class):
-    """[New] 동명이인 안전 체크: 이동하려는 반에 나랑 같은 이름이 있는가?"""
+    """동명이인 체크: target_class에 내 이름과 같은 학생이 이미 있는가?"""
     my_name = df.loc[student_idx, '이름']
-    # target_class에 나랑 이름 같은 사람이 있는지 확인 (나 자신 제외는 호출 로직에서 처리되거나, 이미 다른반이면 상관없음)
+    # 나 자신 제외하고 검색
     same_names = df[
         (df['신학년반'] == target_class) & 
         (df['이름'] == my_name) & 
         (df.index != student_idx)
     ]
     if not same_names.empty:
-        return False # 거기에 내 이름인 애가 또 있어서 못 감
+        return False # 위험
     return True
 
-# --- 배정 로직 함수들 ---
-def allocate_class_logic(df):
-    """초기 배정 (순환 S자)"""
-    results = []
-    for (old_class, gender), sub_df in df.groupby(['2025반', '성별']):
-        sub_df = sub_df.sort_values(by=['총점', '이름'], ascending=[False, True]).copy()
+def check_conflict_safety(df, student_idx, target_class):
+    """분리 요청 체크 (쌍방향 확인)"""
+    student = df.loc[student_idx]
+    
+    # 1. 내가 피하고 싶은 사람이 저기에 있는가?
+    enemy_name = student['conflict_target']
+    if enemy_name:
+        enemies = df[(df['이름'] == enemy_name) & (df['신학년반'] == target_class)]
+        if not enemies.empty: return False # 위험
+
+    # 2. 저기에 있는 누군가가 나를 피하고 싶은가?
+    my_name = student['이름']
+    haters = df[(df['신학년반'] == target_class) & (df['conflict_target'] == my_name)]
+    if not haters.empty: return False # 위험
         
-        if old_class == 1: targets = ['가', '나', '다']
-        elif old_class == 2: targets = ['나', '다', '가']
-        elif old_class == 3: targets = ['다', '가', '나']
+    return True
+
+def check_old_class_constraint(df, student_idx, current_class, min_count=4):
+    """구학년 동성 친구 최소 인원(4명) 보존 체크"""
+    student = df.loc[student_idx]
+    old_cls = student['2025반']
+    gender = student['성별']
+    
+    # 현재 반에 남아있는 내 친구들 수 (나 포함)
+    count = len(df[
+        (df['신학년반'] == current_class) & 
+        (df['2025반'] == old_cls) &
+        (df['성별'] == gender)
+    ])
+    
+    # 내가 나가면 (count-1)명이 됨. 
+    # 즉, 현재 count가 min_count보다 커야만 나갈 수 있음.
+    # (이미 4명 이하라면 더 줄일 수 없음)
+    if count <= min_count:
+        return False
+    return True
+
+# --- 배정 로직 ---
+
+def allocate_initial(df):
+    """1단계: 학반별 순환 S자 배정 (기본)"""
+    results = []
+    # 2025반, 성별로 그룹핑하여 성적순 정렬
+    for (old_cls, gender), sub in df.groupby(['2025반', '성별']):
+        sub = sub.sort_values(by=['총점', '이름'], ascending=[False, True]).copy()
+        
+        # 로테이션 규칙
+        if old_cls == 1: targets = ['가', '나', '다']
+        elif old_cls == 2: targets = ['나', '다', '가']
+        elif old_cls == 3: targets = ['다', '가', '나']
         else: targets = ['가', '나', '다']
             
         new_classes = []
-        for i in range(len(sub_df)):
-            idx = [0, 1, 2, 2, 1, 0][i % 6]
-            new_classes.append(targets[idx])
-            
-        sub_df['신학년반'] = new_classes
-        results.append(sub_df)
-    
+        for i in range(len(sub)):
+            # S자 패턴: 0,1,2, 2,1,0
+            cycle = [0, 1, 2, 2, 1, 0][i % 6]
+            new_classes.append(targets[cycle])
+        
+        sub['신학년반'] = new_classes
+        results.append(sub)
+        
     if not results: return df
     return pd.concat(results, ignore_index=True)
 
-def resolve_homonyms(df):
-    """
-    [New] 동명이인 강제 분리 로직
-    같은 반에 동명이인이 있으면 무조건 다른 반으로 스왑
-    """
+def solve_homonyms(df):
+    """2단계: 동명이인 강제 분리"""
+    names = df['이름'].value_counts()
+    homonyms = names[names > 1].index.tolist()
     classes = ['가', '나', '다']
-    
-    # 동명이인 명단 추출 (2명 이상인 이름)
-    name_counts = df['이름'].value_counts()
-    homonyms = name_counts[name_counts > 1].index.tolist()
     
     for name in homonyms:
-        # 해당 이름을 가진 학생들
         students = df[df['이름'] == name]
-        
-        # 반별로 몇 명 있는지 확인
         cls_counts = students['신학년반'].value_counts()
         
-        for cls, count in cls_counts.items():
-            if count > 1:
-                # 한 반에 2명 이상 있음! -> 분리 필요
-                # 해당 반에 있는 동명이인 학생들 인덱스 찾기
+        for cls, cnt in cls_counts.items():
+            if cnt > 1:
+                # 한 반에 2명 이상 -> 이동 필요
                 targets = students[students['신학년반'] == cls]
-                
-                # 첫 번째 학생은 놔두고, 나머지 학생들을 다른 반으로 이동
-                # (count - 1)명만큼 이동시켜야 함
-                movers = targets.iloc[1:] 
+                # 첫명 빼고 나머지 이동
+                movers = targets.iloc[1:]
                 
                 for idx, row in movers.iterrows():
-                    current_cls = row['신학년반']
+                    current = row['신학년반']
+                    # 이동 가능한 반 (동명이인 없는 곳)
+                    candidates = [c for c in classes if c != current and check_homonym_safety(df, idx, c)]
                     
-                    # 이동 가능한 반 후보 (현재 반 제외 + 이미 이 이름이 있는 반 제외)
-                    candidate_classes = []
-                    for c in classes:
-                        if c == current_cls: continue
-                        # 그 반에 내 이름이 없어야 함
-                        if df[(df['신학년반'] == c) & (df['이름'] == name)].empty:
-                            candidate_classes.append(c)
-                    
-                    # 후보 반으로 이동 시도 (스왑)
                     swapped = False
-                    for target_cls in candidate_classes:
-                        # 제약 조건: 이동 시 앙숙/구반인원 체크
+                    for target_cls in candidates:
+                        # 이동 시 안전 체크
                         if not check_conflict_safety(df, idx, target_cls): continue
-                        if not check_old_class_constraint(df, idx, current_cls): continue
+                        if not check_old_class_constraint(df, idx, current): continue
                         
-                        # 스왑 파트너 찾기
-                        swap_candidates = df[
+                        # 스왑 파트너 찾기 (성별 같고, 일반 학생 우선)
+                        swap_pool = df[
                             (df['신학년반'] == target_cls) &
                             (df['성별'] == row['성별']) &
-                            (df['생활지도_표시'] == False) & # 기왕이면 일반 학생과 교체
-                            (df['이름'] != name) # 내 이름과 다른 사람이어야 함
+                            (df['이름'] != name) # 내 이름 아닌 사람
                         ].copy()
                         
-                        swap_candidates['diff'] = abs(swap_candidates['총점'] - row['총점'])
-                        swap_candidates = swap_candidates.sort_values('diff')
+                        # 점수차 정렬
+                        swap_pool['diff'] = abs(swap_pool['총점'] - row['총점'])
+                        swap_pool = swap_pool.sort_values('diff')
                         
-                        for s_idx, s_row in swap_candidates.iterrows():
-                            # 파트너가 내 반으로 와도 되는지 체크
-                            if not check_conflict_safety(df, s_idx, current_cls): continue
+                        for s_idx, s_row in swap_pool.iterrows():
+                            # 파트너 안전 체크
+                            if not check_conflict_safety(df, s_idx, current): continue
                             if not check_old_class_constraint(df, s_idx, target_cls): continue
-                            # 파트너 이름이 내 반에 이미 있으면 안됨 (드문 경우지만 체크)
-                            if not check_homonym_safety(df, s_idx, current_cls): continue
-
-                            # 스왑 실행
+                            if not check_homonym_safety(df, s_idx, current): continue
+                            
+                            # 교환
                             df.at[idx, '신학년반'] = target_cls
-                            df.at[s_idx, '신학년반'] = current_cls
+                            df.at[s_idx, '신학년반'] = current
                             swapped = True
                             break
-                        
                         if swapped: break
-                    
-                    if not swapped:
-                        # 자동 해결 실패 시 경고용 플래그나 로그가 필요할 수 있음
-                        pass
     return df
 
-def resolve_conflicts_first(df):
-    """분리 배정(앙숙) 해결"""
+def solve_separations(df):
+    """3단계: 분리 요청(앙숙) 해결"""
     classes = ['가', '나', '다']
-    conflict_rows = df[df['분리대상'].notna()]
+    # 분리 요청이 있는 학생만 필터
+    conflicts = df[df['conflict_target'].notna()]
     
-    for idx, row in conflict_rows.iterrows():
-        enemy_name = row['분리대상']
-        my_class = row['신학년반']
-        enemies = df[(df['이름'] == enemy_name) & (df['신학년반'] == my_class)]
+    for idx, row in conflicts.iterrows():
+        enemy = row['conflict_target']
+        current = row['신학년반']
         
-        if not enemies.empty:
-            available_classes = [c for c in classes if c != my_class]
-            for target_class in available_classes:
-                if not check_conflict_safety(df, idx, target_class): continue
-                if not check_old_class_constraint(df, idx, my_class): continue
-                # [New] 동명이인 체크 추가
-                if not check_homonym_safety(df, idx, target_class): continue
+        # 같은 반에 앙숙이 있는지 확인
+        enemies_in_class = df[
+            (df['이름'] == enemy) & (df['신학년반'] == current)
+        ]
+        
+        if not enemies_in_class.empty:
+            # 이동 필요
+            others = [c for c in classes if c != current]
+            
+            for target_cls in others:
+                if not check_conflict_safety(df, idx, target_cls): continue
+                if not check_old_class_constraint(df, idx, current): continue
+                if not check_homonym_safety(df, idx, target_cls): continue
                 
-                swap_candidates = df[
-                    (df['신학년반'] == target_class) &
-                    (df['생활지도_표시'] == False) &
+                # 스왑 파트너
+                swap_pool = df[
+                    (df['신학년반'] == target_cls) &
                     (df['성별'] == row['성별'])
-                ]
-                swap_candidates = swap_candidates.copy()
-                swap_candidates['diff'] = abs(swap_candidates['총점'] - row['총점'])
-                swap_candidates = swap_candidates.sort_values('diff')
+                ].copy()
+                swap_pool['diff'] = abs(swap_pool['총점'] - row['총점'])
+                swap_pool = swap_pool.sort_values('diff')
                 
-                for s_idx, s_row in swap_candidates.iterrows():
-                    if not check_conflict_safety(df, s_idx, my_class): continue
-                    if not check_old_class_constraint(df, s_idx, target_class): continue
-                    if not check_homonym_safety(df, s_idx, my_class): continue
+                for s_idx, s_row in swap_pool.iterrows():
+                    if not check_conflict_safety(df, s_idx, current): continue
+                    if not check_old_class_constraint(df, s_idx, target_cls): continue
+                    if not check_homonym_safety(df, s_idx, current): continue
                     
-                    df.at[idx, '신학년반'] = target_class
-                    df.at[s_idx, '신학년반'] = my_class
-                    break 
+                    df.at[idx, '신학년반'] = target_cls
+                    df.at[s_idx, '신학년반'] = current
+                    break # 다음 앙숙 해결로
     return df
 
-def distribute_special_students_global(df):
-    """생활지도 균형"""
+def balance_behavior(df):
+    """4단계: 생활지도 곤란 학생 균형 (4~6명)"""
     max_iter = 300
-    for i in range(max_iter):
-        counts = df[df['생활지도_표시'] == True]['신학년반'].value_counts()
-        for cls in ['가', '나', '다']:
-            if cls not in counts: counts[cls] = 0
+    
+    for _ in range(max_iter):
+        counts = df[df['is_behavior'] == True]['신학년반'].value_counts()
+        for c in ['가', '나', '다']: 
+            if c not in counts: counts[c] = 0
             
-        if counts.max() - counts.min() <= 1: break
-            
-        src_class = counts.idxmax()
-        dst_class = counts.idxmin()
+        if counts.max() - counts.min() <= 1: break # 균형 도달
         
-        src_candidates = df[(df['신학년반'] == src_class) & (df['생활지도_표시'] == True)]
+        src_cls = counts.idxmax()
+        dst_cls = counts.idxmin()
         
-        best_swap_pair = None
-        min_score_diff = float('inf')
+        # 과밀반의 생활지도 학생들
+        candidates = df[
+            (df['신학년반'] == src_cls) & 
+            (df['is_behavior'] == True)
+        ]
         
-        for src_idx, src_student in src_candidates.iterrows():
-            if not check_conflict_safety(df, src_idx, dst_class): continue
-            if not check_old_class_constraint(df, src_idx, src_class): continue
-            if not check_homonym_safety(df, src_idx, dst_class): continue # [New]
+        best_pair = None
+        min_diff = float('inf')
+        
+        for idx, row in candidates.iterrows():
+            # 이동 안전 체크
+            if not check_conflict_safety(df, idx, dst_cls): continue
+            if not check_old_class_constraint(df, idx, src_cls): continue
+            if not check_homonym_safety(df, idx, dst_cls): continue
             
-            s_gender = src_student['성별']
-            s_score = src_student['총점']
-            
-            dst_candidates = df[
-                (df['신학년반'] == dst_class) & 
-                (df['생활지도_표시'] == False) & 
-                (df['성별'] == s_gender)
+            # 부족반의 일반 학생 찾기
+            targets = df[
+                (df['신학년반'] == dst_cls) &
+                (df['is_behavior'] == False) &
+                (df['성별'] == row['성별'])
             ]
             
-            for d_idx, d_row in dst_candidates.iterrows():
-                if not check_conflict_safety(df, d_idx, src_class): continue
-                if not check_old_class_constraint(df, d_idx, dst_class): continue
-                if not check_homonym_safety(df, d_idx, src_class): continue # [New]
+            for t_idx, t_row in targets.iterrows():
+                if not check_conflict_safety(df, t_idx, src_cls): continue
+                if not check_old_class_constraint(df, t_idx, dst_cls): continue
+                if not check_homonym_safety(df, t_idx, src_cls): continue
                 
-                diff = abs(d_row['총점'] - s_score)
-                if diff < min_score_diff:
-                    min_score_diff = diff
-                    best_swap_pair = (src_idx, d_idx)
+                diff = abs(t_row['총점'] - row['총점'])
+                if diff < min_diff:
+                    min_diff = diff
+                    best_pair = (idx, t_idx)
         
-        if best_swap_pair:
-            s_idx, d_idx = best_swap_pair
-            val_src = df.at[s_idx, '신학년반']
-            val_dst = df.at[d_idx, '신학년반']
-            df.at[s_idx, '신학년반'] = val_dst
-            df.at[d_idx, '신학년반'] = val_src
+        if best_pair:
+            df.at[best_pair[0], '신학년반'] = dst_cls
+            df.at[best_pair[1], '신학년반'] = src_cls
         else:
-            break
+            break # 교환 불가 시 중단
+            
     return df
 
 # --------------------------------------------------------------------------
-# 3. 세션 및 메인 로직
+# 3. 메인 앱 UI 및 로직 실행
 # --------------------------------------------------------------------------
 if 'df_result' not in st.session_state:
     st.session_state.df_result = None
 
-uploaded_file = st.file_uploader("학생 성적 엑셀 파일을 업로드하세요 (.xlsx)", type=['xlsx', 'csv'])
+uploaded_file = st.file_uploader("최신 양식의 엑셀 파일을 업로드하세요 (생활지도/분리요청 컬럼 포함)", type=['xlsx', 'csv'])
 
 if uploaded_file is not None and st.session_state.df_result is None:
     try:
-        file_name = uploaded_file.name
-        if file_name.endswith('.csv'):
+        if uploaded_file.name.endswith('.csv'):
             df_raw = pd.read_csv(uploaded_file)
         else:
             df_raw = pd.read_excel(uploaded_file)
@@ -324,148 +332,148 @@ if uploaded_file is not None and st.session_state.df_result is None:
         if error_msg:
             st.error(error_msg)
         else:
-            # 1. 초기 배정
-            df_allocated = allocate_class_logic(df)
-            df_allocated = df_allocated.reset_index(drop=True)
-            
-            # 2. [New] 동명이인 분리 (최우선)
-            df_allocated = resolve_homonyms(df_allocated)
-            
-            # 3. 앙숙 관계 해결
-            df_allocated = resolve_conflicts_first(df_allocated)
-            
-            # 4. 생활지도 균형
-            df_final = distribute_special_students_global(df_allocated)
-            
-            # 비고 생성 (동명이인 표시 추가)
-            name_counts = df_final['이름'].value_counts()
-            homonym_list = name_counts[name_counts > 1].index.tolist()
-            
-            def make_note(row):
-                notes = []
-                if row['이름'] in homonym_list: notes.append('★동명이인')
-                if row['생활지도_표시']: notes.append('★생활지도')
-                if row['분리대상']: notes.append(f"(분리:{row['분리대상']})")
-                return ' '.join(notes)
-            df_final['비고'] = df_final.apply(make_note, axis=1)
-            
-            st.session_state.df_result = df_final
-            st.success("✅ 반편성 완료! (동명이인 분리 및 구학년 4명 이상 보장)")
-            st.rerun()
-
+            # 알고리즘 실행 파이프라인
+            with st.spinner('반편성 알고리즘 수행 중...'):
+                # 1. 초기 배정
+                df = allocate_initial(df)
+                df = df.reset_index(drop=True)
+                
+                # 2. 동명이인 분리
+                df = solve_homonyms(df)
+                
+                # 3. 분리 요청 해결
+                df = solve_separations(df)
+                
+                # 4. 생활지도 균형
+                df = balance_behavior(df)
+                
+                # 비고 작성
+                def make_note(row):
+                    notes = []
+                    # 동명이인 확인
+                    if len(df[df['이름'] == row['이름']]) > 1:
+                        notes.append("★동명이인")
+                    if row['is_behavior']:
+                        notes.append("★생활지도")
+                    if row['conflict_target']:
+                        notes.append(f"(분리:{row['conflict_target']})")
+                    return " ".join(notes)
+                
+                df['비고'] = df.apply(make_note, axis=1)
+                
+                st.session_state.df_result = df
+                st.success("✅ 반편성 완료! (생활지도/분리요청 이원화 적용)")
+                st.rerun()
+                
     except Exception as e:
         st.error(f"오류 발생: {e}")
 
-# --------------------------------------------------------------------------
-# 4. 결과 화면
-# --------------------------------------------------------------------------
+# 결과 화면
 if st.session_state.df_result is not None:
-    df_display = st.session_state.df_result.copy()
+    df_disp = st.session_state.df_result.copy()
     
-    df_display['성별_order'] = df_display['성별'].apply(lambda x: 0 if x != '남' else 1)
-    df_display = df_display.sort_values(by=['신학년반', '성별_order', '이름']).reset_index(drop=True)
+    # 정렬
+    df_disp['성별_order'] = df_disp['성별'].apply(lambda x: 0 if x != '남' else 1)
+    df_disp = df_disp.sort_values(by=['신학년반', '성별_order', '이름']).reset_index(drop=True)
     
     cols = ['신학년반', '이름', '성별', '2025반', '2025번호', '총점', '비고']
     
+    # 엑셀 다운로드
     col_h, col_b = st.columns([3, 1])
-    with col_h: st.subheader("📋 반편성 결과")
+    with col_h: st.subheader("📋 최종 결과물")
     with col_b:
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_display[cols].to_excel(writer, index=False, sheet_name='반편성결과')
-        st.download_button("📥 엑셀 다운로드", data=output.getvalue(), file_name="2026_반편성_최종.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+            df_disp[cols].to_excel(writer, index=False, sheet_name='반편성결과')
+        st.download_button("📥 엑셀 다운로드", data=output.getvalue(), file_name="2026_반편성_완료.xlsx", type="primary")
 
     st.divider()
 
-    # 맞교환 기능
-    with st.expander("🔄 학생 반 맞교환 (수동)", expanded=True):
-        df_display['선택라벨'] = df_display.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점)", axis=1)
+    # 수동 교환 UI
+    with st.expander("🛠️ 수동 교환 (관리자용)", expanded=True):
+        df_disp['label'] = df_disp.apply(lambda x: f"{x['이름']} ({x['신학년반']} / {x['총점']}점)", axis=1)
         c1, c2, c3 = st.columns([2, 2, 1])
-        with c1: s_a = st.selectbox("학생 A", df_display['선택라벨'].unique(), key='a')
-        with c2: s_b = st.selectbox("학생 B", df_display['선택라벨'].unique(), key='b')
+        with c1: s_a = st.selectbox("학생 A", df_disp['label'].unique(), key='a')
+        with c2: s_b = st.selectbox("학생 B", df_disp['label'].unique(), key='b')
         with c3:
             st.write(""); st.write("")
-            if st.button("교환하기"):
+            if st.button("교환 실행"):
                 if s_a != s_b:
-                    try:
-                        row_a = df_display[df_display['선택라벨'] == s_a].iloc[0]
-                        row_b = df_display[df_display['선택라벨'] == s_b].iloc[0]
-                        
-                        idx_a = st.session_state.df_result[
-                            (st.session_state.df_result['이름'] == row_a['이름']) &
-                            (st.session_state.df_result['2025반'] == row_a['2025반']) &
-                            (st.session_state.df_result['2025번호'] == row_a['2025번호'])
-                        ].index[0]
-                        
-                        idx_b = st.session_state.df_result[
-                            (st.session_state.df_result['이름'] == row_b['이름']) &
-                            (st.session_state.df_result['2025반'] == row_b['2025반']) &
-                            (st.session_state.df_result['2025번호'] == row_b['2025번호'])
-                        ].index[0]
-                        
-                        # 안전 및 인원 체크 (수동 경고)
-                        safe_a = check_conflict_safety(st.session_state.df_result, idx_a, row_b['신학년반'])
-                        safe_b = check_conflict_safety(st.session_state.df_result, idx_b, row_a['신학년반'])
-                        if not (safe_a and safe_b): st.warning("⚠️ 주의: 분리 배정 위반 가능성")
-                        
-                        old_a = check_old_class_constraint(st.session_state.df_result, idx_a, row_a['신학년반'])
-                        old_b = check_old_class_constraint(st.session_state.df_result, idx_b, row_b['신학년반'])
-                        if not (old_a and old_b): st.warning("⚠️ 주의: 구학년 동성 친구 4명 미만 발생 가능성")
-                        
-                        # 동명이인 체크
-                        homo_a = check_homonym_safety(st.session_state.df_result, idx_a, row_b['신학년반'])
-                        homo_b = check_homonym_safety(st.session_state.df_result, idx_b, row_a['신학년반'])
-                        if not (homo_a and homo_b): st.warning("⚠️ 주의: 이동하는 반에 동명이인이 있습니다!")
+                    # 인덱스 찾기
+                    r_a = df_disp[df_disp['label'] == s_a].iloc[0]
+                    r_b = df_disp[df_disp['label'] == s_b].iloc[0]
+                    
+                    # 고유 식별 (이름+구반+번호)
+                    idx_a = st.session_state.df_result[
+                        (st.session_state.df_result['이름'] == r_a['이름']) &
+                        (st.session_state.df_result['2025반'] == r_a['2025반']) &
+                        (st.session_state.df_result['2025번호'] == r_a['2025번호'])
+                    ].index[0]
+                    idx_b = st.session_state.df_result[
+                        (st.session_state.df_result['이름'] == r_b['이름']) &
+                        (st.session_state.df_result['2025반'] == r_b['2025반']) &
+                        (st.session_state.df_result['2025번호'] == r_b['2025번호'])
+                    ].index[0]
+                    
+                    # 안전 체크 (경고만)
+                    warns = []
+                    # 동명이인
+                    if not check_homonym_safety(st.session_state.df_result, idx_a, r_b['신학년반']): warns.append("A가 가면 동명이인 발생")
+                    if not check_homonym_safety(st.session_state.df_result, idx_b, r_a['신학년반']): warns.append("B가 오면 동명이인 발생")
+                    # 분리요청
+                    if not check_conflict_safety(st.session_state.df_result, idx_a, r_b['신학년반']): warns.append("A의 분리요청 위반")
+                    if not check_conflict_safety(st.session_state.df_result, idx_b, r_a['신학년반']): warns.append("B의 분리요청 위반")
+                    # 구반인원
+                    if not check_old_class_constraint(st.session_state.df_result, idx_a, r_a['신학년반']): warns.append("A반 구학년 인원 부족")
+                    if not check_old_class_constraint(st.session_state.df_result, idx_b, r_b['신학년반']): warns.append("B반 구학년 인원 부족")
+                    
+                    if warns:
+                        st.warning("⚠️ 주의: " + ", ".join(warns))
+                    
+                    # 교환
+                    va = st.session_state.df_result.at[idx_a, '신학년반']
+                    vb = st.session_state.df_result.at[idx_b, '신학년반']
+                    st.session_state.df_result.at[idx_a, '신학년반'] = vb
+                    st.session_state.df_result.at[idx_b, '신학년반'] = va
+                    st.success("교환되었습니다.")
+                    st.rerun()
 
-                        val_a = st.session_state.df_result.at[idx_a, '신학년반']
-                        val_b = st.session_state.df_result.at[idx_b, '신학년반']
-                        st.session_state.df_result.at[idx_a, '신학년반'] = val_b
-                        st.session_state.df_result.at[idx_b, '신학년반'] = val_a
-                        
-                        st.success("교환 완료!"); st.rerun()
-                    except: st.error("오류 발생")
-                else: st.warning("다른 학생 선택")
-
+    # 탭별 보기
     tabs = st.tabs(["가반", "나반", "다반", "전체"])
     
-    def show_tab(cls_name):
-        subset = df_display[df_display['신학년반'] == cls_name][cols]
-        count = len(subset)
-        special = len(subset[subset['비고'].str.contains('생활지도')])
-        avg = subset['총점'].mean() if count > 0 else 0
+    def show_stats(cls_name):
+        sub = df_disp[df_disp['신학년반'] == cls_name]
+        cnt = len(sub)
+        # 생활지도 카운트 (is_behavior 컬럼 기준)
+        # 원본 데이터프레임에서 가져와야 정확함 (비고는 텍스트라)
+        real_sub = st.session_state.df_result[st.session_state.df_result['신학년반'] == cls_name]
+        beh_cnt = len(real_sub[real_sub['is_behavior'] == True])
         
-        # 구반 성별 분포
-        old_dist = subset.groupby(['2025반', '성별']).size().unstack(fill_value=0)
-        if '남' not in old_dist.columns: old_dist['남'] = 0
-        if '여' not in old_dist.columns: old_dist['여'] = 0
+        avg = sub['총점'].mean() if cnt > 0 else 0
         
-        dist_str_list = []
-        warning_msg = ""
-        for cls_num, row in old_dist.iterrows():
-            m_cnt, f_cnt = row.get('남', 0), row.get('여', 0)
-            dist_str_list.append(f"{cls_num}반(남{m_cnt}/여{f_cnt})")
-            if m_cnt > 0 and m_cnt < 4: warning_msg = " (남 4명 미만!)"
-            if f_cnt > 0 and f_cnt < 4: warning_msg = " (여 4명 미만!)"
-        
-        # 동명이인 체크
-        name_counts = subset['이름'].value_counts()
-        homonym_conflict = name_counts[name_counts > 1].count()
-        homonym_msg = f" | ⚠️ 같은반 동명이인: {homonym_conflict}쌍" if homonym_conflict > 0 else ""
-        
-        st.info(f"👥 총원: {count}명 | ⚠️ 생활지도: {special}명 | 📊 평균: {avg:.1f}점{homonym_msg}")
-        
-        if warning_msg: st.error(f"🚨 출신 분포: {', '.join(dist_str_list)} {warning_msg}")
-        else: st.success(f"✅ 출신 분포: {', '.join(dist_str_list)}")
+        # 구반 분포
+        dist = sub.groupby(['2025반', '성별']).size().unstack(fill_value=0)
+        dist_str = []
+        err = False
+        for c_idx, row in dist.iterrows():
+            m = row.get('남', 0)
+            f = row.get('여', 0)
+            dist_str.append(f"{c_idx}반({m}/{f})")
+            if (m > 0 and m < 4) or (f > 0 and f < 4): err = True
+            
+        st.info(f"👥 {cnt}명 | 생활지도: {beh_cnt}명 | 평균: {avg:.1f}")
+        if err: st.error(f"구학년 분포: {', '.join(dist_str)} (4명 미만 주의)")
+        else: st.success(f"구학년 분포: {', '.join(dist_str)}")
         
         st.dataframe(
-            subset.style.apply(lambda x: ['background-color: #ffcccc' if '생활지도' in v else ('background-color: #ffffcc' if '동명이인' in v else '') for v in x], subset=['비고'], axis=1),
-            use_container_width=True, hide_index=True, height=800
+            sub[cols].style.apply(lambda x: ['background-color: #ffcccc' if '★' in str(v) else '' for v in x], subset=['비고'], axis=1),
+            use_container_width=True, hide_index=True, height=600
         )
 
-    with tabs[0]: show_tab('가')
-    with tabs[1]: show_tab('나')
-    with tabs[2]: show_tab('다')
-    with tabs[3]: st.dataframe(df_display[cols], use_container_width=True, height=800)
+    with tabs[0]: show_stats('가')
+    with tabs[1]: show_stats('나')
+    with tabs[2]: show_stats('다')
+    with tabs[3]: st.dataframe(df_disp[cols], use_container_width=True, height=800)
     
     if st.button("초기화"):
         st.session_state.df_result = None
